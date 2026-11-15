@@ -1,0 +1,269 @@
+name: AppImage (vncviewer)
+
+# Builds the TigerVNC viewer as a portable x86_64 AppImage and publishes it as
+# a GitHub Release asset.
+#
+# The build environment is Ubuntu 22.04 ("jammy", glibc 2.35).  This is
+# deliberately older than the current LTS: glibc is forward compatible, so an
+# AppImage built there runs on mainstream/newer distributions (Ubuntu 22.04+,
+# Debian 12+, Fedora 36+, RHEL 9+, Arch, openSUSE Leap 15.5+, ...), while still
+# being a supported LTS that receives security updates.
+#
+# Triggers:
+#   * push to master       -> package the fork's current master
+#   * schedule (daily)     -> fetch and package the latest TigerVNC/tigervnc
+#                             master (the fork may lag behind upstream)
+#   * workflow_dispatch    -> manual build, optionally from upstream
+
+on:
+  push:
+    branches: [master]
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+    inputs:
+      build_upstream:
+        description: "Build latest TigerVNC/tigervnc master instead of this fork's HEAD"
+        type: boolean
+        default: true
+      force:
+        description: "Build even if a release for this commit already exists"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: appimage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build vncviewer AppImage
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 1
+
+      # Scheduled/manual builds should follow upstream rather than waiting for
+      # the fork to be synced manually.
+      - name: Build latest upstream master
+        if: github.event_name == 'schedule' || inputs.build_upstream
+        run: |
+          git remote add upstream https://github.com/TigerVNC/tigervnc.git
+          git fetch --no-tags --depth=1 upstream master
+          git checkout --detach FETCH_HEAD
+          echo "Building TigerVNC upstream commit: $(git rev-parse HEAD)"
+
+      - name: Compute metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^set(VERSION \([^)]*\))$/\1/p' CMakeLists.txt | head -n1)
+          if [ -z "$version" ]; then
+            echo "Could not determine TigerVNC version" >&2
+            exit 1
+          fi
+          sha=$(git rev-parse HEAD)
+          short=${sha:0:12}
+          stamp=$(date -u +%Y%m%dT%H%M%SZ)
+          tag="appimage-${version}-g${short}"
+          asset="TigerVNC-Viewer-${version}-${short}-x86_64.AppImage"
+          {
+            echo "version=$version"
+            echo "sha=$sha"
+            echo "short=$short"
+            echo "stamp=$stamp"
+            echo "tag=$tag"
+            echo "asset=$asset"
+          } >> "$GITHUB_OUTPUT"
+          echo "TigerVNC ${version} at ${sha}"
+
+      - name: Check for an existing release
+        id: existing
+        if: github.event_name != 'workflow_dispatch' || inputs.force != true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${{ steps.meta.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release ${{ steps.meta.outputs.tag }} already exists; nothing to do."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set build decision
+        id: decide
+        run: |
+          if [ "${{ steps.existing.outputs.exists }}" = "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install build dependencies
+        if: steps.decide.outputs.skip != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake gettext \
+            libfltk1.3-dev \
+            libpixman-1-dev libjpeg-turbo8-dev \
+            libgnutls28-dev nettle-dev libgmp-dev \
+            libx11-dev libxext-dev libxi-dev libxrender-dev \
+            libxrandr-dev libxfixes-dev libxdamage-dev libxtst-dev \
+            libxcursor-dev libxinerama-dev libxft-dev libfontconfig1-dev \
+            libavcodec-dev libavutil-dev libswscale-dev \
+            libpulse-dev \
+            file patchelf desktop-file-utils
+
+      - name: Configure
+        if: steps.decide.outputs.skip != 'true'
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DBUILD_VIEWER=ON \
+            -DBUILD_JAVA=OFF \
+            -DBUILD_STATIC_GCC=ON \
+            -DENABLE_NLS=ON \
+            -DENABLE_GNUTLS=ON \
+            -DENABLE_NETTLE=ON \
+            -DENABLE_H264=ON \
+            -DENABLE_AUDIO=ON \
+            -DENABLE_PAM=OFF \
+            -DENABLE_SYSTEMD=OFF \
+            -DENABLE_SELINUX=OFF \
+            -DENABLE_PWQUALITY=OFF \
+            -DENABLE_WAYLAND=OFF
+
+      - name: Build viewer
+        if: steps.decide.outputs.skip != 'true'
+        run: |
+          cmake --build build --parallel "$(nproc)" \
+            --target vncviewer desktop appstream translations
+
+      - name: Assemble AppDir
+        if: steps.decide.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          appdir="$PWD/AppDir"
+          rm -rf "$appdir"
+          mkdir -p "$appdir/usr/bin" \
+                   "$appdir/usr/share/applications" \
+                   "$appdir/usr/share/metainfo" \
+                   "$appdir/usr/share/icons/hicolor"
+
+          install -Dm755 build/vncviewer/vncviewer "$appdir/usr/bin/vncviewer"
+
+          # The generated desktop file hard-codes the absolute Exec path
+          # (/usr/bin/vncviewer).  Inside an AppImage the mount point is random,
+          # so use a relative program name and let AppRun resolve it.
+          install -Dm644 build/vncviewer/vncviewer.desktop \
+            "$appdir/usr/share/applications/vncviewer.desktop"
+          sed -i 's|^Exec=.*|Exec=vncviewer|' \
+            "$appdir/usr/share/applications/vncviewer.desktop"
+          cp "$appdir/usr/share/applications/vncviewer.desktop" "$appdir/vncviewer.desktop"
+
+          install -Dm644 build/vncviewer/org.tigervnc.vncviewer.metainfo.xml \
+            "$appdir/usr/share/metainfo/org.tigervnc.vncviewer.metainfo.xml"
+
+          for size in 16 22 24 32 48 64 128; do
+            install -Dm644 "media/icons/tigervnc_${size}.png" \
+              "$appdir/usr/share/icons/hicolor/${size}x${size}/apps/tigervnc.png"
+          done
+          install -Dm644 media/icons/tigervnc.svg \
+            "$appdir/usr/share/icons/hicolor/scalable/apps/tigervnc.svg"
+          cp media/icons/tigervnc_128.png "$appdir/tigervnc.png"
+
+          for mo in build/po/*.mo; do
+            lang=$(basename "$mo" .mo)
+            install -Dm644 "$mo" \
+              "$appdir/usr/share/locale/${lang}/LC_MESSAGES/tigervnc.mo"
+          done
+
+          install -Dm644 LICENCE.TXT \
+            "$appdir/usr/share/doc/tigervnc/LICENCE.TXT"
+
+      - name: Package AppImage
+        if: steps.decide.outputs.skip != 'true'
+        env:
+          ASSET: ${{ steps.meta.outputs.asset }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -o linuxdeploy \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy
+
+          # CI runners have no FUSE, so extract-and-run the packaging tool.
+          ARCH=x86_64 OUTPUT="$ASSET" ./linuxdeploy --appimage-extract-and-run \
+            --appdir "$PWD/AppDir" \
+            --desktop-file "$PWD/AppDir/vncviewer.desktop" \
+            --icon-file "$PWD/AppDir/tigervnc.png" \
+            --output appimage
+
+          test -f "$ASSET"
+          sha256sum "$ASSET" > "$ASSET.sha256"
+          ls -lh "$ASSET" "$ASSET.sha256"
+
+      - name: Smoke test AppImage
+        if: steps.decide.outputs.skip != 'true'
+        env:
+          ASSET: ${{ steps.meta.outputs.asset }}
+        run: |
+          set -euo pipefail
+          ./"$ASSET" --appimage-extract-and-run --help | head -n 8
+          ./"$ASSET" --appimage-extract-and-run --version | head -n 3
+
+      - name: Upload Artifact
+        if: steps.decide.outputs.skip != 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: TigerVNC-Viewer-${{ steps.meta.outputs.version }}-${{ steps.meta.outputs.short }}-x86_64
+          # AppImages are already compressed; avoid a double-zip penalty.
+          compression-level: 0
+          path: |
+            ${{ steps.meta.outputs.asset }}
+            ${{ steps.meta.outputs.asset }}.sha256
+
+      - name: Create GitHub Release
+        if: steps.decide.outputs.skip != 'true'
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: TigerVNC Viewer ${{ steps.meta.outputs.version }} (AppImage, ${{ steps.meta.outputs.short }})
+          body: |
+            Automated TigerVNC viewer AppImage build.
+
+            - TigerVNC version: `${{ steps.meta.outputs.version }}`
+            - Commit: `${{ steps.meta.outputs.sha }}`
+            - Built (UTC): `${{ steps.meta.outputs.stamp }}`
+            - Build base: Ubuntu 22.04 (glibc 2.35)
+            - Features: FLTK 1.3 GUI, TLS (GnuTLS), RSA-AES (Nettle), H.264 (FFmpeg), PulseAudio, translations
+
+            Supported systems: x86_64 Linux with glibc >= 2.35, i.e. Ubuntu 22.04+,
+            Debian 12+, Fedora 36+, RHEL 9+, Arch, openSUSE Leap 15.5+ and newer.
+            An X11/XWayland session is required (the viewer is an X11/FLTK application).
+
+            Run it:
+
+            ```sh
+            chmod +x ${{ steps.meta.outputs.asset }}
+            ./${{ steps.meta.outputs.asset }}
+            ```
+
+            Verify the download with `sha256sum -c ${{ steps.meta.outputs.asset }}.sha256`.
+
+            Upstream project: https://github.com/TigerVNC/tigervnc
+          files: |
+            ${{ steps.meta.outputs.asset }}
+            ${{ steps.meta.outputs.asset }}.sha256
+          prerelease: false
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
