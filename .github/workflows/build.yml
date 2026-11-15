@@ -1,6 +1,8 @@
 name: Build
 
-on: [push, pull_request]
+# Upstream runs this on every push/PR. In this fork only the AppImage
+# workflow should trigger automatically, so keep this available manually.
+on: workflow_dispatch
 
 jobs:
   build-linux:

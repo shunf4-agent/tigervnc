@@ -18,6 +18,11 @@ name: AppImage (vncviewer)
 on:
   push:
     branches: [master]
+    # Do not rebuild the AppImage just because an unrelated upstream workflow
+    # was adjusted. These workflow files are disabled in this fork anyway.
+    paths-ignore:
+      - ".github/workflows/build.yml"
+      - ".github/workflows/msvc.yml"
   schedule:
     - cron: "23 4 * * *"
   workflow_dispatch:
